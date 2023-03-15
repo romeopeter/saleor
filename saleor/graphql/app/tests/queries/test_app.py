@@ -32,6 +32,7 @@ QUERY_APP = """
             configurationUrl
             appUrl
             accessToken
+            author
             extensions{
                 id
                 label
@@ -72,6 +73,7 @@ def test_app_query(
     app = app if app_type == "custom" else external_app
     app.permissions.add(permission_manage_staff)
     app.store_value_in_metadata({"test": "123"})
+    app.author = "Acme Ltd"
     app.save()
 
     webhook = webhook
@@ -105,6 +107,7 @@ def test_app_query(
     assert app_data["supportUrl"] == app.support_url
     assert app_data["configurationUrl"] == app.configuration_url
     assert app_data["appUrl"] == app.app_url
+    assert app_data["author"] == app.author
     if app_type == "external":
         assert app_data["accessToken"] == create_access_token_for_app(
             app, staff_api_client.user
@@ -314,6 +317,21 @@ def test_app_with_extensions_query(
         assigned_permissions = [p.codename for p in app_extension.permissions.all()]
         assigned_permissions = [{"code": p.upper()} for p in assigned_permissions]
         assert assigned_permissions in returned_permission_codes
+
+
+def test_app_query_pending_installation(staff_api_client, app):
+    # given
+    app.is_installed = False
+    app.save(update_fields=["is_installed"])
+    id = graphene.Node.to_global_id("App", app.id)
+    variables = {"id": id}
+
+    # when
+    response = staff_api_client.post_graphql(QUERY_APP, variables=variables)
+    content = get_graphql_content(response)
+
+    # then
+    assert content["data"]["app"] is None
 
 
 QUERY_APP_AVAILABLE_FOR_STAFF_WITHOUT_MANAGE_APPS = """

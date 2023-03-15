@@ -31,7 +31,7 @@ from ..core.taxes import TaxError, zero_taxed_money
 from ..core.tracing import traced_atomic_transaction
 from ..core.transactions import transaction_with_commit_on_errors
 from ..core.utils.url import validate_storefront_url
-from ..discount import DiscountInfo, DiscountValueType, OrderDiscountType, VoucherType
+from ..discount import DiscountInfo, DiscountValueType, OrderDiscountType
 from ..discount.models import NotApplicable
 from ..discount.utils import (
     add_voucher_usage_by_customer,
@@ -84,7 +84,6 @@ from .utils import get_or_create_checkout_metadata, get_voucher_for_checkout_inf
 
 if TYPE_CHECKING:
     from ..app.models import App
-    from ..discount.models import Voucher
     from ..plugins.manager import PluginsManager
     from ..site.models import SiteSettings
 
@@ -205,7 +204,8 @@ def _create_line_for_order(
     if translated_variant_name == variant_name:
         translated_variant_name = ""
 
-    # the price with sale discount - base price that is used for total price calculation
+    # the price with sale and discounts applied - base price that is used for
+    # total price calculation
     base_unit_price = calculate_base_line_unit_price(
         line_info=checkout_line_info, channel=checkout_info.channel, discounts=discounts
     )
@@ -423,8 +423,6 @@ def _prepare_order_data(
         address=address,
         discounts=discounts,
     )
-    # checkout.discount contains only discounts applied on entire order
-    undiscounted_total = taxed_total + checkout.discount
 
     base_shipping_price = base_checkout_delivery_price(checkout_info, lines)
     shipping_total = calculations.checkout_shipping_price(
@@ -455,15 +453,13 @@ def _prepare_order_data(
         discounts,
         prices_entered_with_tax,
     )
-    # Calculate the discount that was applied for each lines - the sales and voucher
-    # discounts on specific products are included on the line level and are not included
-    # in the checkout.discount amount.
-    line_discounts = zero_taxed_money(checkout.currency)
-    for line in order_data["lines"]:
-        line_discounts += line.line.undiscounted_total_price - line.line.total_price
-
-    # include discounts applied on lines, in order undiscounted total price
-    undiscounted_total += line_discounts
+    undiscounted_total = (
+        sum(
+            [line.line.undiscounted_total_price for line in order_data["lines"]],
+            start=zero_taxed_money(taxed_total.currency),
+        )
+        + shipping_total
+    )
 
     order_data.update(
         {
@@ -540,7 +536,7 @@ def _create_order(
 
     status = (
         OrderStatus.UNFULFILLED
-        if site_settings.automatically_confirm_all_new_orders
+        if checkout_info.channel.automatically_confirm_all_new_orders
         else OrderStatus.UNCONFIRMED
     )
     order = Order.objects.create(
@@ -552,27 +548,8 @@ def _create_order(
         should_refresh_prices=False,
         tax_exemption=checkout_info.checkout.tax_exemption,
     )
-    if checkout.discount:
-        # store voucher as a fixed value as it this the simplest solution for now.
-        # This will be solved when we refactor the voucher logic to use .discounts
-        # relations
-        voucher = order_data.get("voucher")
-        # When we have a voucher for specific products we track it directly in the
-        # Orderline. Voucher with 'apply_once_per_order' is handled in the same way
-        # as we apply it only for single quantity of the cheapest item.
-        if not voucher or (
-            voucher.type != VoucherType.SPECIFIC_PRODUCT
-            and not voucher.apply_once_per_order
-        ):
-            order.discounts.create(
-                type=OrderDiscountType.VOUCHER,
-                value_type=DiscountValueType.FIXED,
-                value=checkout.discount.amount,
-                name=checkout.discount_name,
-                translated_name=checkout.translated_discount_name,
-                currency=checkout.currency,
-                amount_value=checkout.discount_amount,
-            )
+
+    _handle_checkout_discount(order, checkout)
 
     order_lines = []
     for line_info in order_lines_info:
@@ -983,30 +960,20 @@ def _handle_allocations_of_order_lines(
     )
 
 
-def _handle_checkout_discount(
-    order: "Order", checkout: "Checkout", voucher: Optional["Voucher"]
-):
+def _handle_checkout_discount(order: "Order", checkout: "Checkout"):
     if checkout.discount:
         # store voucher as a fixed value as it this the simplest solution for now.
         # This will be solved when we refactor the voucher logic to use .discounts
         # relations
-
-        # When we have a voucher for specific products we track it directly in the
-        # Orderline. Voucher with 'apply_once_per_order' is handled in the same way
-        # as we apply it only for single quantity of the cheapest item.
-        if not voucher or (
-            voucher.type != VoucherType.SPECIFIC_PRODUCT
-            and not voucher.apply_once_per_order
-        ):
-            order.discounts.create(
-                type=OrderDiscountType.VOUCHER,
-                value_type=DiscountValueType.FIXED,
-                value=checkout.discount.amount,
-                name=checkout.discount_name,
-                translated_name=checkout.translated_discount_name,
-                currency=checkout.currency,
-                amount_value=checkout.discount_amount,
-            )
+        order.discounts.create(
+            type=OrderDiscountType.VOUCHER,
+            value_type=DiscountValueType.FIXED,
+            value=checkout.discount.amount,
+            name=checkout.discount_name,
+            translated_name=checkout.translated_discount_name,
+            currency=checkout.currency,
+            amount_value=checkout.discount_amount,
+        )
 
 
 def _post_create_order_actions(
@@ -1100,7 +1067,7 @@ def _create_order_from_checkout(
     # status
     status = (
         OrderStatus.UNFULFILLED
-        if site_settings.automatically_confirm_all_new_orders
+        if checkout_info.channel.automatically_confirm_all_new_orders
         else OrderStatus.UNCONFIRMED
     )
     checkout_metadata = get_or_create_checkout_metadata(checkout_info.checkout)
@@ -1143,7 +1110,7 @@ def _create_order_from_checkout(
     )
 
     # checkout discount
-    _handle_checkout_discount(order, checkout_info.checkout, voucher)
+    _handle_checkout_discount(order, checkout_info.checkout)
 
     # lines
     order_lines_info = _create_order_lines_from_checkout_lines(

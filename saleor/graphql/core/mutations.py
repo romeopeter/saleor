@@ -48,7 +48,7 @@ from ..meta.permissions import PRIVATE_META_PERMISSION_MAP, PUBLIC_META_PERMISSI
 from ..payment.utils import metadata_contains_empty_key
 from ..plugins.dataloaders import get_plugin_manager_promise
 from ..utils import get_nodes, resolve_global_ids_to_primary_keys
-from .context import set_mutation_flag_in_context, setup_context_user
+from .context import disallow_replica_in_context, setup_context_user
 from .descriptions import DEPRECATED_IN_3X_FIELD
 from .types import (
     TYPES_WITH_DOUBLE_ID_AVAILABLE,
@@ -484,7 +484,7 @@ class BaseMutation(graphene.Mutation):
         return instance
 
     @classmethod
-    def check_permissions(cls, context, permissions=None):
+    def check_permissions(cls, context, permissions=None, **data):
         """Determine whether user or app has rights to perform this mutation.
 
         Default implementation assumes that account is allowed to perform any
@@ -501,10 +501,10 @@ class BaseMutation(graphene.Mutation):
 
     @classmethod
     def mutate(cls, root, info: ResolveInfo, **data):
-        set_mutation_flag_in_context(info.context)
+        disallow_replica_in_context(info.context)
         setup_context_user(info.context)
 
-        if not cls.check_permissions(info.context):
+        if not cls.check_permissions(info.context, data=data):
             raise PermissionDenied(permissions=cls._meta.permissions)
         manager = get_plugin_manager_promise(info.context).get()
         result = manager.perform_mutation(
@@ -937,7 +937,7 @@ class BaseBulkMutation(BaseMutation):
 
     @classmethod
     def mutate(cls, root, info: ResolveInfo, **data):
-        set_mutation_flag_in_context(info.context)
+        disallow_replica_in_context(info.context)
         setup_context_user(info.context)
 
         if not cls.check_permissions(info.context):

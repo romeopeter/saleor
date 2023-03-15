@@ -900,7 +900,7 @@ def test_query_user_avatar_with_size_thumbnail_url_returned(
     )
 
 
-def test_query_user_avatar_only_format_provided_original_image_returned(
+def test_query_user_avatar_original_size_custom_format_provided_original_image_returned(
     staff_api_client, media_root, permission_manage_staff, site_settings
 ):
     # given
@@ -913,7 +913,7 @@ def test_query_user_avatar_only_format_provided_original_image_returned(
     format = ThumbnailFormatEnum.WEBP.name
 
     id = graphene.Node.to_global_id("User", user.pk)
-    variables = {"id": id, "format": format}
+    variables = {"id": id, "format": format, "size": 0}
 
     # when
     response = staff_api_client.post_graphql(
@@ -942,6 +942,8 @@ def test_query_user_avatar_no_size_value(
     id = graphene.Node.to_global_id("User", user.pk)
     variables = {"id": id}
 
+    user_uuid = graphene.Node.to_global_id("User", user.uuid)
+
     # when
     response = staff_api_client.post_graphql(
         USER_AVATAR_QUERY, variables, permissions=[permission_manage_staff]
@@ -952,7 +954,7 @@ def test_query_user_avatar_no_size_value(
     data = content["data"]["user"]
     assert (
         data["avatar"]["url"]
-        == f"http://{site_settings.site.domain}/media/user-avatars/{avatar_mock.name}"
+        == f"http://{site_settings.site.domain}/thumbnail/{user_uuid}/4096/"
     )
 
 
@@ -4377,7 +4379,7 @@ def test_set_password_invalid_password(user_api_client, customer_user, settings)
 
 
 CHANGE_PASSWORD_MUTATION = """
-    mutation PasswordChange($oldPassword: String!, $newPassword: String!) {
+    mutation PasswordChange($oldPassword: String, $newPassword: String!) {
         passwordChange(oldPassword: $oldPassword, newPassword: $newPassword) {
             errors {
                 field
@@ -4446,6 +4448,69 @@ def test_password_change_invalid_new_password(user_api_client, settings):
     )
     assert errors[1]["field"] == "newPassword"
     assert errors[1]["message"] == "This password is entirely numeric."
+
+
+def test_password_change_user_unusable_password_fails_if_old_password_is_set(
+    user_api_client,
+):
+    customer_user = user_api_client.user
+    customer_user.set_unusable_password()
+    customer_user.save()
+
+    new_password = "spanish-inquisition"
+
+    variables = {"oldPassword": "password", "newPassword": new_password}
+    response = user_api_client.post_graphql(CHANGE_PASSWORD_MUTATION, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["passwordChange"]
+    assert data["errors"]
+    assert data["errors"][0]["field"] == "oldPassword"
+
+    customer_user.refresh_from_db()
+    assert not customer_user.has_usable_password()
+
+
+def test_password_change_user_unusable_password_if_old_password_is_omitted(
+    user_api_client,
+):
+    customer_user = user_api_client.user
+    customer_user.set_unusable_password()
+    customer_user.save()
+
+    new_password = "spanish-inquisition"
+
+    variables = {"oldPassword": None, "newPassword": new_password}
+    response = user_api_client.post_graphql(CHANGE_PASSWORD_MUTATION, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["passwordChange"]
+    assert not data["errors"]
+    assert data["user"]["email"] == customer_user.email
+
+    customer_user.refresh_from_db()
+    assert customer_user.check_password(new_password)
+
+    password_change_event = account_events.CustomerEvent.objects.get()
+    assert password_change_event.type == account_events.CustomerEvents.PASSWORD_CHANGED
+    assert password_change_event.user == customer_user
+
+
+def test_password_change_user_usable_password_fails_if_old_password_is_omitted(
+    user_api_client,
+):
+    customer_user = user_api_client.user
+
+    new_password = "spanish-inquisition"
+
+    variables = {"newPassword": new_password}
+    response = user_api_client.post_graphql(CHANGE_PASSWORD_MUTATION, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["passwordChange"]
+    assert data["errors"]
+    assert data["errors"][0]["field"] == "oldPassword"
+
+    customer_user.refresh_from_db()
+    assert customer_user.has_usable_password()
+    assert not customer_user.check_password(new_password)
 
 
 ADDRESS_CREATE_MUTATION = """
@@ -5213,6 +5278,7 @@ REQUEST_PASSWORD_RESET_MUTATION = """
             errors {
                 field
                 message
+                code
             }
         }
     }
@@ -5271,6 +5337,56 @@ def test_account_reset_password(
         payload=expected_payload,
         channel_slug=channel_PLN.slug,
     )
+    user = user_api_client.user
+    user.refresh_from_db()
+    assert user.last_password_reset_request == timezone.now()
+
+
+@freeze_time("2018-05-31 12:00:01")
+@patch("saleor.plugins.manager.PluginsManager.notify")
+def test_account_reset_password_on_cooldown(
+    mocked_notify, user_api_client, customer_user, channel_PLN
+):
+    redirect_url = "https://www.example.com"
+    variables = {
+        "email": customer_user.email,
+        "redirectUrl": redirect_url,
+        "channel": channel_PLN.slug,
+    }
+    user = user_api_client.user
+    user.last_password_reset_request = timezone.now()
+    user.save(update_fields=["last_password_reset_request"])
+    response = user_api_client.post_graphql(REQUEST_PASSWORD_RESET_MUTATION, variables)
+    content = get_graphql_content(response)
+    errors = content["data"]["requestPasswordReset"]["errors"]
+    assert errors == [
+        {
+            "field": "email",
+            "message": "Password reset already requested",
+            "code": AccountErrorCode.PASSWORD_RESET_ALREADY_REQUESTED.name,
+        }
+    ]
+    mocked_notify.assert_not_called()
+
+
+@freeze_time("2018-05-31 12:00:01")
+def test_account_reset_password_after_cooldown(
+    user_api_client, customer_user, channel_PLN, settings
+):
+    redirect_url = "https://www.example.com"
+    variables = {
+        "email": customer_user.email,
+        "redirectUrl": redirect_url,
+        "channel": channel_PLN.slug,
+    }
+    user = user_api_client.user
+    user.last_password_reset_request = timezone.now() - datetime.timedelta(
+        seconds=settings.RESET_PASSWORD_LOCK_TIME
+    )
+    user.save(update_fields=["last_password_reset_request"])
+    response = user_api_client.post_graphql(REQUEST_PASSWORD_RESET_MUTATION, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["requestPasswordReset"]["errors"] == []
 
 
 @freeze_time("2018-05-31 12:00:01")
@@ -5834,7 +5950,7 @@ USER_AVATAR_UPDATE_MUTATION = """
     mutation userAvatarUpdate($image: Upload!) {
         userAvatarUpdate(image: $image) {
             user {
-                avatar {
+                avatar(size: 0) {
                     url
                 }
             }
